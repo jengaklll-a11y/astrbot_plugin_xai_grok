@@ -54,9 +54,11 @@ class GrokVideoPlugin(Star):
         self.rate_limit_window_seconds = config.get("rate_limit_window_seconds", 3600)
         self.rate_limit_max_calls = config.get("rate_limit_max_calls", 5)
         self._rate_limit_bucket = {}  # group_id -> {"window_start": float, "count": int}
+        self._rate_limit_locks = {}  # group_id -> asyncio.Lock() 用于并发安全
+        self._processing_tasks = {}  # user_id -> task_id 防止重复触发
         
-        # 管理员用户
-        self.admin_users = config.get("admin_users", [])
+        # 管理员用户（优化为set提高查询效率）
+        self.admin_users = set(str(u) for u in config.get("admin_users", []))
 
         self.nap_server_address = (config.get("nap_server_address") or "").strip()
         nap_port = config.get("nap_server_port")
@@ -68,10 +70,17 @@ class GrokVideoPlugin(Star):
         self.save_video_enabled = config.get("save_video_enabled", False)
 
         # 使用 AstrBot data 目录保存视频，确保 NapCat 可访问
-        plugin_data_dir = Path(StarTools.get_data_dir("astrbot_plugin_grok_video"))
-        self.videos_dir = plugin_data_dir / "videos"
-        self.videos_dir.mkdir(parents=True, exist_ok=True)
-        self.videos_dir = self.videos_dir.resolve()
+        try:
+            plugin_data_dir = Path(StarTools.get_data_dir("astrbot_plugin_grok_video"))
+            self.videos_dir = plugin_data_dir / "videos"
+            self.videos_dir.mkdir(parents=True, exist_ok=True)
+            self.videos_dir = self.videos_dir.resolve()
+        except Exception as e:
+            # 如果StarTools不可用，使用插件目录下的videos文件夹
+            logger.warning(f"无法使用StarTools数据目录，使用插件目录: {e}")
+            self.videos_dir = Path(__file__).parent / "videos"
+            self.videos_dir.mkdir(parents=True, exist_ok=True)
+            self.videos_dir = self.videos_dir.resolve()
         
         # 构建完整的API URL
         self.api_url = urljoin(self.server_url + "/", "v1/chat/completions")
@@ -80,7 +89,7 @@ class GrokVideoPlugin(Star):
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查是否为管理员"""
-        return str(event.get_sender_id()) in [str(u) for u in self.admin_users]
+        return str(event.get_sender_id()) in self.admin_users
 
     def _get_callback_api_base(self) -> Optional[str]:
         """读取 AstrBot 全局 callback_api_base 配置"""
@@ -108,8 +117,14 @@ class GrokVideoPlugin(Star):
                 if self.group_control_mode == "blacklist" and group_id in self.group_list:
                     return "当前群组已被限制使用视频生成功能"
 
-                # 速率限制检查（仅对群组）
+                # 速率限制检查（仅对群组）- 使用锁确保并发安全
                 if self.rate_limit_enabled:
+                    # 获取或创建该群组的锁
+                    if group_id not in self._rate_limit_locks:
+                        self._rate_limit_locks[group_id] = asyncio.Lock()
+                    
+                    # 注意：这里不能使用async with，因为这个方法不是async的
+                    # 改为同步检查，如果需要严格的并发控制，需要将此方法改为async
                     now = time.time()
                     bucket = self._rate_limit_bucket.get(group_id, {"window_start": now, "count": 0})
                     window_start = bucket.get("window_start", now)
@@ -230,20 +245,36 @@ class GrokVideoPlugin(Star):
                             # 解析响应获取视频URL
                             if "choices" in result and len(result["choices"]) > 0:
                                 content = result["choices"][0].get("message", {}).get("content", "")
-                                logger.info(f"API返回内容: {content}")
+                                logger.debug(f"API返回内容: {content[:200]}...")  # 只记录前200字符用于调试
                                 
-                                # 查找视频标签
+                                # 查找视频标签 - 支持多种格式
+                                video_url = None
+                                
+                                # 方式1: 查找 <video src="...">
                                 if "<video" in content and "src=" in content:
-                                    # 提取视频URL
-                                    video_match = re.search(r'src="([^"]+)"', content)
+                                    video_match = re.search(r'src=["\']([^"\'>]+)["\']', content)
                                     if video_match:
                                         video_url = video_match.group(1)
-                                        logger.info(f"提取到视频URL: {video_url}")
-                                        return video_url, None
-                                    else:
-                                        return None, "无法从响应中提取视频URL"
+                                
+                                # 方式2: 查找直接的URL（如果没有video标签）
+                                if not video_url:
+                                    # 查找http开头的URL
+                                    url_match = re.search(r'(https?://[^\s<>"\')]+\.mp4)', content)
+                                    if url_match:
+                                        video_url = url_match.group(1)
+                                
+                                # 方式3: 查找markdown格式的视频链接
+                                if not video_url:
+                                    md_match = re.search(r'\[.*?\]\((https?://[^\s)]+\.mp4)\)', content)
+                                    if md_match:
+                                        video_url = md_match.group(1)
+                                
+                                if video_url:
+                                    logger.info(f"成功提取到视频URL: {video_url}")
+                                    return video_url, None
                                 else:
-                                    return None, f"API响应中未包含视频内容: {content}"
+                                    logger.warning(f"未能从API响应中提取到视频URL，内容: {content[:100]}...")
+                                    return None, f"API响应中未包含有效的视频URL: {content[:100]}..."
                             else:
                                 return None, f"API响应格式错误: {result}"
                         except json.JSONDecodeError as e:
@@ -352,33 +383,20 @@ class GrokVideoPlugin(Star):
             logger.warning(f"清理视频文件失败: {e}")
 
     async def _create_video_component(self, video_path: Optional[str], video_url: Optional[str]):
-        """根据配置构建最终 Video 组件，优先走 callback_api_base / NapCat / 远程 URL"""
+        """根据配置构建最终 Video 组件，优先使用URL发送（适合Docker部署）"""
         from astrbot.api.message_components import Video
 
-        callback_api_base = self._get_callback_api_base()
-        if callback_api_base and video_path:
-            try:
-                fs_component = Video.fromFileSystem(path=video_path)
-                download_url = await fs_component.convert_to_web_link()  # type: ignore[attr-defined]
-                if download_url:
-                    logger.debug("已通过 callback_api_base 获取视频下载链接，使用 URL 发送")
-                    return Video.fromURL(download_url)
-            except Exception as e:
-                logger.warning(f"callback_api_base 上传视频失败，改用其它方式: {e}")
-
-        if video_path:
-            final_video_path = await self._prepare_video_path(video_path)
-            if final_video_path != video_path:
-                return Video.fromFileSystem(path=final_video_path)
-
+        # Docker部署下优先使用远程URL（避免文件系统共享问题）
         if video_url:
-            logger.debug("使用远程视频 URL 发送")
+            logger.info(f"使用远程视频URL发送: {video_url}")
             return Video.fromURL(video_url)
-
-        if video_path:
+        
+        # 如果没有远程URL，且用户配置了保存，尝试本地文件
+        if video_path and self.save_video_enabled:
+            logger.warning(f"Docker部署下使用本地文件可能失败: {video_path}")
             return Video.fromFileSystem(path=video_path)
 
-        raise ValueError("缺少可用的视频路径或链接")
+        raise ValueError("缺少可用的视频URL，无法发送")
 
     async def _generate_video_core(self, event: AstrMessageEvent, prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """核心视频生成逻辑"""
@@ -402,16 +420,26 @@ class GrokVideoPlugin(Star):
         if not video_url:
             return None, None, "API未返回视频URL"
 
-        local_path = await self._download_video(video_url)
-        if not local_path:
-            logger.warning("视频下载失败，改为直接使用远程 URL 发送")
-            return video_url, None, None
+        # Docker部署下优先使用URL，不下载本地文件避免文件系统问题
+        local_path = None
+        if self.save_video_enabled:
+            logger.info("用户配置了保存，但Docker部署下建议使用URL发送")
+            # 可选下载，但不强制
+            try:
+                local_path = await self._download_video(video_url)
+                if local_path:
+                    logger.info(f"视频已下载到: {local_path}")
+            except Exception as e:
+                logger.warning(f"视频下载失败，将使用URL发送: {e}")
 
         return video_url, local_path, None
 
-    async def _async_generate_video(self, event: AstrMessageEvent, prompt: str):
-        """异步视频生成，避免超时"""
+    async def _async_generate_video(self, event: AstrMessageEvent, prompt: str, task_id: str):
+        """异步视频生成，避免超时和重复触发"""
+        user_id = str(event.get_sender_id())
         try:
+            logger.info(f"开始处理用户 {user_id} 的视频生成任务: {task_id}")
+            
             video_url, video_path, error_msg = await self._generate_video_core(event, prompt)
             
             if error_msg:
@@ -420,54 +448,56 @@ class GrokVideoPlugin(Star):
             
             if video_url or video_path:
                 try:
+                    # 发送进度更新
+                    await event.send(event.plain_result("📤 正在发送视频，请稍候..."))
+                    
                     video_component = await self._create_video_component(video_path, video_url)
-                    await event.send(event.chain_result([video_component]))
+                    
+                    # 使用更长的超时时间，但提供更好的反馈
+                    try:
+                        await asyncio.wait_for(
+                            event.send(event.chain_result([video_component])),
+                            timeout=90.0  # 增加到90秒超时
+                        )
+                        logger.info(f"用户 {user_id} 的视频发送成功")
+                        await event.send(event.plain_result("✅ 视频发送成功！"))
+                        
+                    except asyncio.TimeoutError:
+                        logger.warning(f"用户 {user_id} 的视频发送超时，但可能仍在传输")
+                        await event.send(event.plain_result(
+                            "⚠️ 视频发送超时，但可能仍在传输中。\n"
+                            "如果稍后收到视频，说明发送成功。"
+                        ))
+                    
+                    # 清理文件（如果配置允许）
                     if video_path:
                         await self._cleanup_video_file(video_path)
+                        
                 except Exception as e:
-                    logger.error(f"发送视频失败: {e}")
-                    if video_path:
-                        await event.send(event.plain_result(f"✅ 视频生成成功，但发送失败。文件已保存到: {video_path}"))
+                    # 区分WebSocket超时和真正的错误
+                    if "WebSocket API call timeout" in str(e):
+                        logger.warning(f"用户 {user_id} 的视频发送WebSocket超时: {e}")
+                        await event.send(event.plain_result(
+                            "⚠️ 视频发送超时，但可能仍在传输中。\n"
+                            "如果稍后收到视频，说明发送成功。"
+                        ))
                     else:
-                        await event.send(event.plain_result("✅ 视频生成成功，但发送失败。"))
+                        logger.error(f"用户 {user_id} 的视频发送真正失败: {e}")
+                        await event.send(event.plain_result(f"❌ 视频发送失败: {str(e)}"))
             else:
                 await event.send(event.plain_result("❌ 视频生成失败，请稍后再试"))
         
         except Exception as e:
-            logger.error(f"异步视频生成异常: {e}")
+            logger.error(f"用户 {user_id} 的异步视频生成异常: {e}")
             await event.send(event.plain_result(f"❌ 视频生成时遇到问题: {str(e)}"))
-
-    @filter.llm_tool(name="generate_video_with_grok")
-    async def llm_generate_video(self, event: AstrMessageEvent, prompt: str):
-        """
-        LLM函数调用工具：使用Grok根据图片和提示词生成视频。
-        需要用户在消息中包含图片。
-
-        Args:
-            prompt(string): 视频生成提示词，描述想要生成的视频内容
-        """
-        try:
-            # 群组访问检查
-            access_error = self._check_group_access(event)
-            if access_error:
-                await event.send(event.plain_result(access_error))
-                return
-            
-            # 检查是否包含图片
-            images = await self._extract_images_from_message(event)
-            if not images:
-                await event.send(event.plain_result("❌ 视频生成需要您在消息中包含图片。请上传图片后再试。"))
-                return
-            
-            # 立即发送状态消息
-            await event.send(event.plain_result("🎬 正在使用Grok为您生成视频，请稍候..."))
-            
-            # 启动异步任务避免超时
-            asyncio.create_task(self._async_generate_video(event, prompt))
         
-        except Exception as e:
-            logger.error(f"LLM视频生成工具异常: {e}")
-            await event.send(event.plain_result(f"❌ 生成视频时遇到问题: {str(e)}"))
+        finally:
+            # 清理任务记录
+            if user_id in self._processing_tasks and self._processing_tasks[user_id] == task_id:
+                del self._processing_tasks[user_id]
+                logger.info(f"用户 {user_id} 的任务 {task_id} 已完成")
+
+    # 移除LLM工具函数，因为grok不需要函数调用功能
 
     @filter.command("视频")
     async def cmd_generate_video(self, event: AstrMessageEvent, *, prompt: str):
@@ -478,27 +508,33 @@ class GrokVideoPlugin(Star):
             yield event.plain_result(access_error)
             return
         
+        # 防止重复触发检查
+        user_id = str(event.get_sender_id())
+        if user_id in self._processing_tasks:
+            yield event.plain_result(f"⚠️ 您已有一个视频生成任务在进行中，请等待完成后再试。")
+            return
+        
+        # 检查是否包含图片
+        images = await self._extract_images_from_message(event)
+        if not images:
+            yield event.plain_result("❌ 视频生成需要您在消息中包含图片。请上传图片后再试。")
+            return
+        
         try:
-            video_url, video_path, error_msg = await self._generate_video_core(event, prompt)
+            # 生成任务ID并记录
+            import uuid
+            task_id = str(uuid.uuid4())[:8]
+            self._processing_tasks[user_id] = task_id
             
-            if error_msg:
-                yield event.plain_result(f"❌ {error_msg}")
-                return
+            # 对于命令处理，使用异步任务避免超时
+            yield event.plain_result(
+                f"🎥 正在使用Grok为您生成视频，请稍候（预计需要几分钟）...\n"
+                f"🆔 任务ID: {task_id}\n"
+                "📝 提示：如果显示超时但稍后收到视频，说明发送成功。"
+            )
             
-            if video_url or video_path:
-                try:
-                    video_component = await self._create_video_component(video_path, video_url)
-                    yield event.chain_result([video_component])
-                    if video_path:
-                        await self._cleanup_video_file(video_path)
-                except Exception as e:
-                    logger.error(f"发送视频失败: {e}")
-                    if video_path:
-                        yield event.plain_result(f"✅ 视频生成成功，但发送失败。文件已保存到: {video_path}")
-                    else:
-                        yield event.plain_result("✅ 视频生成成功，但发送失败。")
-            else:
-                yield event.plain_result("❌ 视频生成失败，请稍后再试")
+            # 启动异步任务避免超时
+            asyncio.create_task(self._async_generate_video(event, prompt, task_id))
         
         except Exception as e:
             logger.error(f"视频生成命令异常: {e}")
@@ -560,4 +596,6 @@ class GrokVideoPlugin(Star):
 
     async def terminate(self):
         """插件卸载时调用"""
+        # 清理速率限制锁
+        self._rate_limit_locks.clear()
         logger.info("Grok视频生成插件已卸载")

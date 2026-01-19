@@ -469,7 +469,7 @@ class GrokMediaPlugin(Star):
 
     @filter.command("视频")
     async def cmd_video(self, event: AstrMessageEvent, *, prompt: str):
-        """/视频 <提示词> (需附带图片或)"""
+        """/视频 <提示词> (需附带图片)"""
         # 启用裁剪
         images = await self._extract_images_from_message(event, crop_for_video=True)
         if not images: yield event.plain_result("❌ 视频生成需要提供图片"); return

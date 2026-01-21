@@ -50,7 +50,7 @@ class GrokMediaPlugin(Star):
 
         # 数据保存目录
         try:
-            plugin_data_dir = Path(StarTools.get_data_dir("astrbot_plugin_grok_video"))
+            plugin_data_dir = Path(StarTools.get_data_dir("astrbot_plugin_xai_grok"))
             self.data_dir = plugin_data_dir / "downloads"
             self.data_dir.mkdir(parents=True, exist_ok=True)
             self.data_dir = self.data_dir.resolve()
@@ -552,3 +552,4 @@ class GrokMediaPlugin(Star):
         else:
             # 无图 -> 文生图 (image)
             async for res in self._process_task(event, prompt, "image", None): yield res
+
